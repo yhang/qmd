@@ -25,6 +25,8 @@
   (thanks @Mic92)
 - Sync duplicated `handelize()` test expectations with the restored lowercase
   behavior.
+- Include `line` in `--json` search output so editor integrations can jump
+  directly to `file:line`. Closes #505 (thanks @danmackinlay)
 
 ## [2.0.1] - 2026-03-10
 
