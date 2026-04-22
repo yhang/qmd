@@ -468,35 +468,40 @@ async function showStatus(): Promise<void> {
   }
 
   // Device / GPU info
-  console.log(`\n${c.bold}Device${c.reset}`);
-  try {
-    const llm = getDefaultLlamaCpp();
-    const device = await llm.getDeviceInfo({ allowBuild: false });
-    if (device.gpu) {
-      console.log(`  GPU:      ${c.green}${device.gpu}${c.reset} (offloading: ${device.gpuOffloading ? 'yes' : 'no'})`);
-      if (device.gpuDevices.length > 0) {
-        // Deduplicate and count GPUs
-        const counts = new Map<string, number>();
-        for (const name of device.gpuDevices) {
-          counts.set(name, (counts.get(name) || 0) + 1);
+  // Important: probing node-llama-cpp can abort the whole process on machines with
+  // incompatible GPU drivers (for example Vulkan loader present but no usable driver).
+  // Keep `qmd status` safe by default and make the expensive/native probe opt-in.
+  if (process.env.QMD_STATUS_DEVICE_PROBE === "1") {
+    console.log(`\n${c.bold}Device${c.reset}`);
+    try {
+      const llm = getDefaultLlamaCpp();
+      const device = await llm.getDeviceInfo({ allowBuild: false });
+      if (device.gpu) {
+        console.log(`  GPU:      ${c.green}${device.gpu}${c.reset} (offloading: ${device.gpuOffloading ? 'yes' : 'no'})`);
+        if (device.gpuDevices.length > 0) {
+          // Deduplicate and count GPUs
+          const counts = new Map<string, number>();
+          for (const name of device.gpuDevices) {
+            counts.set(name, (counts.get(name) || 0) + 1);
+          }
+          const deviceStr = Array.from(counts.entries())
+            .map(([name, count]) => count > 1 ? `${count}× ${name}` : name)
+            .join(', ');
+          console.log(`  Devices:  ${deviceStr}`);
         }
-        const deviceStr = Array.from(counts.entries())
-          .map(([name, count]) => count > 1 ? `${count}× ${name}` : name)
-          .join(', ');
-        console.log(`  Devices:  ${deviceStr}`);
+        if (device.vram) {
+          console.log(`  VRAM:     ${formatBytes(device.vram.free)} free / ${formatBytes(device.vram.total)} total`);
+        }
+      } else {
+        console.log(`  GPU:      ${c.yellow}none${c.reset} (running on CPU — models will be slow)`);
+        console.log(`  ${c.dim}Tip: Install CUDA, Vulkan, or Metal support for GPU acceleration.${c.reset}`);
       }
-      if (device.vram) {
-        console.log(`  VRAM:     ${formatBytes(device.vram.free)} free / ${formatBytes(device.vram.total)} total`);
+      console.log(`  CPU:      ${device.cpuCores} math cores`);
+    } catch (error) {
+      console.log(`  Status:   ${c.dim}probe failed${c.reset}`);
+      if (error instanceof Error && error.message) {
+        console.log(`  ${c.dim}${error.message}${c.reset}`);
       }
-    } else {
-      console.log(`  GPU:      ${c.yellow}none${c.reset} (running on CPU — models will be slow)`);
-      console.log(`  ${c.dim}Tip: Install CUDA, Vulkan, or Metal support for GPU acceleration.${c.reset}`);
-    }
-    console.log(`  CPU:      ${device.cpuCores} math cores`);
-  } catch (error) {
-    console.log(`  Status:   ${c.dim}skipped${c.reset} (status probe does not build llama.cpp backends)`);
-    if (error instanceof Error && error.message) {
-      console.log(`  ${c.dim}${error.message}${c.reset}`);
     }
   }
 
