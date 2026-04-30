@@ -792,6 +792,41 @@ vectors_vec     -- sqlite-vec vector index (hash_seq key)
 llm_cache       -- Cached LLM responses (query expansion, rerank scores)
 ```
 
+## Multilingual / Chinese Support
+
+QMD can improve Chinese (and other CJK) retrieval without changing default English behavior. ASCII paths stay the same unless you opt in with environment variables.
+
+**FTS5 (`QMD_FTS_*`)**
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `QMD_FTS_TOKENIZER` | `porter unicode61` | FTS5 tokenizer (allowlist only). Use `auto` for `porter unicode61` when jieba segmentation is active, otherwise `trigram`. |
+| `QMD_FTS_SEGMENTER` | `identity` | `identity`: store raw bodies (default, same as upstream). `jieba` / `auto`: word-segment CJK runs for FTS bodies when `@node-rs/jieba` is installed and tokenizer family is `porter` / `unicode61`. |
+
+After you install jieba and set `QMD_FTS_SEGMENTER=jieba` (or `auto` with tokenizer `auto`), the next `qmd` command reconciles the index automatically—**no `qmd update` required** for FTS body resync (only for re-scanning disk).
+
+**Trigram** tokenizer uses 3-character grams: short CJK queries (1–2 characters) often miss. Prefer `QMD_FTS_TOKENIZER=auto` plus `QMD_FTS_SEGMENTER=auto` when jieba is available for better short-query recall.
+
+**Embeddings (`QMD_EMBED_FORMAT`)**
+
+| Value | Meaning |
+|-------|---------|
+| `gemma` | `task: search result \| query: …` style |
+| `qwen3` | Qwen3-Embedding instruct format |
+| `bge-m3` | Raw query/doc text (for BGE-M3) |
+| `raw` | No special prefixes |
+
+URI detection picks `bge-m3` only for `bge-?m3` models; other models default to `raw` unless you set `QMD_EMBED_FORMAT`.
+
+**Query expansion (`QMD_EXPAND_*`)**
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `QMD_EXPAND_LANG` | `auto` | `auto`: CJK queries skip the English-tuned expansion LLM when using the default generate model (returns original `lex` + `vec`). `en` / `zh` / `force` always call the LLM; `skip` always bypasses. |
+| `QMD_EXPAND_PROMPT` | _(unset)_ | Custom template with `{query}` and `{intent}`; if set, forces LLM expansion (except when `QMD_EXPAND_LANG=skip`). |
+
+Reuse `QMD_EMBED_MODEL`, `QMD_GENERATE_MODEL`, and YAML `models.*` as today; effective generate model drives the `auto` CJK bypass together with `config.models.generate`.
+
 ## Environment Variables
 
 | Variable | Default | Description |

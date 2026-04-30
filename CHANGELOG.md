@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Added
+
+- Multilingual support: optional `@node-rs/jieba` FTS body segmentation behind `QMD_FTS_SEGMENTER`, tokenizer allowlist via `QMD_FTS_TOKENIZER` (including `auto` + sqlite_master–driven rebuild), embedding prompt registry (`QMD_EMBED_FORMAT`, BGE-M3 detection), and CJK-aware query expansion bypass / prompts via `QMD_EXPAND_LANG` and `QMD_EXPAND_PROMPT`. `qmd status` shows a Multilingual section.
+
 ### Fixes
 
 - GPU: respect explicit `QMD_LLAMA_GPU=metal|vulkan|cuda` backend overrides instead of always using auto GPU selection. #529

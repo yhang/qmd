@@ -139,6 +139,7 @@ bun test --preload ./src/test-preload.ts test/
 - Reciprocal Rank Fusion (RRF) for combining results
 - Smart chunking: 900 tokens/chunk with 15% overlap, prefers markdown headings as boundaries
 - AST-aware chunking: use `--chunk-strategy auto` to chunk code files (.ts/.js/.py/.go/.rs) at function/class/import boundaries via tree-sitter. Default is `regex` (existing behavior). Markdown and unknown file types always use regex chunking.
+- Optional CJK / multilingual: FTS jieba segmentation and tokenizer reconcile (`QMD_FTS_*`), embed format registry including BGE-M3 (`QMD_EMBED_FORMAT`), expansion language and bypass (`QMD_EXPAND_LANG`, `QMD_EXPAND_PROMPT`); see README **Multilingual / Chinese Support**.
 
 ## Important: Do NOT run automatically
 

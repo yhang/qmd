@@ -14,6 +14,7 @@ import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
+  buildFTS5Query,
   createStore,
   structuredSearch,
   validateSemanticQuery,
@@ -394,145 +395,98 @@ describe("lex query syntax", () => {
 // =============================================================================
 
 describe("buildFTS5Query (lex parser)", () => {
-  // Mirror the function for unit testing
-  function sanitizeFTS5Term(term: string): string {
-    return term.replace(/[^\p{L}\p{N}']/gu, '').toLowerCase();
-  }
-
-  function isHyphenatedToken(token: string): boolean {
-    return /^[\p{L}\p{N}][\p{L}\p{N}'-]*-[\p{L}\p{N}][\p{L}\p{N}'-]*$/u.test(token);
-  }
-
-  function sanitizeHyphenatedTerm(term: string): string {
-    return term.split('-').map(t => sanitizeFTS5Term(t)).filter(t => t).join(' ');
-  }
-
-  function buildFTS5Query(query: string): string | null {
-    const positive: string[] = [];
-    const negative: string[] = [];
-    let i = 0;
-    const s = query.trim();
-
-    while (i < s.length) {
-      while (i < s.length && /\s/.test(s[i]!)) i++;
-      if (i >= s.length) break;
-      const negated = s[i] === '-';
-      if (negated) i++;
-
-      if (s[i] === '"') {
-        const start = i + 1; i++;
-        while (i < s.length && s[i] !== '"') i++;
-        const phrase = s.slice(start, i).trim();
-        i++;
-        if (phrase.length > 0) {
-          const sanitized = phrase.split(/\s+/).map((t: string) => sanitizeFTS5Term(t)).filter((t: string) => t).join(' ');
-          if (sanitized) (negated ? negative : positive).push(`"${sanitized}"`);
-        }
-      } else {
-        const start = i;
-        while (i < s.length && !/[\s"]/.test(s[i]!)) i++;
-        const term = s.slice(start, i);
-
-        if (isHyphenatedToken(term)) {
-          const sanitized = sanitizeHyphenatedTerm(term);
-          if (sanitized) (negated ? negative : positive).push(`"${sanitized}"`);
-        } else {
-          const sanitized = sanitizeFTS5Term(term);
-          if (sanitized) (negated ? negative : positive).push(`"${sanitized}"*`);
-        }
-      }
-    }
-
-    if (positive.length === 0 && negative.length === 0) return null;
-    if (positive.length === 0) return null;
-
-    let result = positive.join(' AND ');
-    for (const neg of negative) result = `${result} NOT ${neg}`;
-    return result;
-  }
+  const porter = "porter";
 
   test("plain terms → prefix match with AND", () => {
-    expect(buildFTS5Query("foo bar")).toBe('"foo"* AND "bar"*');
+    expect(buildFTS5Query("foo bar", porter)).toBe('"foo"* AND "bar"*');
   });
 
   test("single term", () => {
-    expect(buildFTS5Query("performance")).toBe('"performance"*');
+    expect(buildFTS5Query("performance", porter)).toBe('"performance"*');
   });
 
   test("quoted phrase → exact match (no prefix)", () => {
-    expect(buildFTS5Query('"machine learning"')).toBe('"machine learning"');
+    expect(buildFTS5Query('"machine learning"', porter)).toBe('"machine learning"');
   });
 
   test("quoted phrase with mixed case sanitized", () => {
-    expect(buildFTS5Query('"C++ performance"')).toBe('"c performance"');
+    expect(buildFTS5Query('"C++ performance"', porter)).toBe('"c performance"');
   });
 
   test("negation of term", () => {
-    expect(buildFTS5Query("performance -sports")).toBe('"performance"* NOT "sports"*');
+    expect(buildFTS5Query("performance -sports", porter)).toBe('"performance"* NOT "sports"*');
   });
 
   test("negation of phrase", () => {
-    expect(buildFTS5Query('performance -"sports athlete"')).toBe('"performance"* NOT "sports athlete"');
+    expect(buildFTS5Query('performance -"sports athlete"', porter)).toBe('"performance"* NOT "sports athlete"');
   });
 
   test("multiple negations", () => {
-    expect(buildFTS5Query("performance -sports -athlete")).toBe('"performance"* NOT "sports"* NOT "athlete"*');
+    expect(buildFTS5Query("performance -sports -athlete", porter)).toBe('"performance"* NOT "sports"* NOT "athlete"*');
   });
 
   test("quoted positive + negation", () => {
-    expect(buildFTS5Query('"machine learning" -sports -athlete')).toBe('"machine learning" NOT "sports"* NOT "athlete"*');
+    expect(buildFTS5Query('"machine learning" -sports -athlete', porter)).toBe('"machine learning" NOT "sports"* NOT "athlete"*');
   });
 
   test("intent-aware C++ performance example", () => {
-    const result = buildFTS5Query('"C++ performance" optimization -sports -athlete');
+    const result = buildFTS5Query('"C++ performance" optimization -sports -athlete', porter);
     expect(result).toContain('NOT "sports"*');
     expect(result).toContain('NOT "athlete"*');
     expect(result).toContain('"optimization"*');
   });
 
   test("only negations with no positives → null (can't search)", () => {
-    expect(buildFTS5Query("-sports -athlete")).toBeNull();
+    expect(buildFTS5Query("-sports -athlete", porter)).toBeNull();
   });
 
   test("empty string → null", () => {
-    expect(buildFTS5Query("")).toBeNull();
-    expect(buildFTS5Query("   ")).toBeNull();
+    expect(buildFTS5Query("", porter)).toBeNull();
+    expect(buildFTS5Query("   ", porter)).toBeNull();
   });
 
   test("special chars in terms stripped", () => {
-    expect(buildFTS5Query("hello!world")).toBe('"helloworld"*');
+    expect(buildFTS5Query("hello!world", porter)).toBe('"helloworld"*');
   });
 
   // Hyphenated token tests
   test("hyphenated term → phrase match", () => {
-    expect(buildFTS5Query("multi-agent")).toBe('"multi agent"');
+    expect(buildFTS5Query("multi-agent", porter)).toBe('"multi agent"');
   });
 
   test("hyphenated identifier → phrase match", () => {
-    expect(buildFTS5Query("DEC-0054")).toBe('"dec 0054"');
+    expect(buildFTS5Query("DEC-0054", porter)).toBe('"dec 0054"');
   });
 
   test("hyphenated model name → phrase match", () => {
-    expect(buildFTS5Query("gpt-4")).toBe('"gpt 4"');
+    expect(buildFTS5Query("gpt-4", porter)).toBe('"gpt 4"');
   });
 
   test("multi-hyphen term → phrase match", () => {
-    expect(buildFTS5Query("foo-bar-baz")).toBe('"foo bar baz"');
+    expect(buildFTS5Query("foo-bar-baz", porter)).toBe('"foo bar baz"');
   });
 
   test("hyphenated term mixed with plain terms", () => {
-    expect(buildFTS5Query("multi-agent memory")).toBe('"multi agent" AND "memory"*');
+    expect(buildFTS5Query("multi-agent memory", porter)).toBe('"multi agent" AND "memory"*');
   });
 
   test("negation still works alongside hyphenated terms", () => {
-    expect(buildFTS5Query("multi-agent -sports")).toBe('"multi agent" NOT "sports"*');
+    expect(buildFTS5Query("multi-agent -sports", porter)).toBe('"multi agent" NOT "sports"*');
   });
 
   test("negated hyphenated term", () => {
-    expect(buildFTS5Query("performance -multi-agent")).toBe('"performance"* NOT "multi agent"');
+    expect(buildFTS5Query("performance -multi-agent", porter)).toBe('"performance"* NOT "multi agent"');
   });
 
   test("plain negation still works (not confused with hyphen)", () => {
-    expect(buildFTS5Query("performance -sports")).toBe('"performance"* NOT "sports"*');
+    expect(buildFTS5Query("performance -sports", porter)).toBe('"performance"* NOT "sports"*');
+  });
+
+  test("trigram + CJK plain term: no prefix star", () => {
+    expect(buildFTS5Query("中国", "trigram")).toBe('"中国"');
+  });
+
+  test("porter + CJK plain term: prefix star", () => {
+    expect(buildFTS5Query("中国", porter)).toBe('"中国"*');
   });
 });

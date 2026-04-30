@@ -17,6 +17,8 @@ import {
 import { homedir } from "os";
 import { join } from "path";
 import { existsSync, mkdirSync, statSync, unlinkSync, readdirSync, readFileSync, writeFileSync, openSync, readSync, closeSync } from "fs";
+import { detectEmbedFormat, FORMATS } from "./embedFormat.js";
+import { buildExpandPrompt } from "./expandPrompt.js";
 
 // =============================================================================
 // Embedding Formatting Functions
@@ -27,7 +29,11 @@ import { existsSync, mkdirSync, statSync, unlinkSync, readdirSync, readFileSync,
  * Qwen3-Embedding uses a different prompting style than nomic/embeddinggemma.
  */
 export function isQwen3EmbeddingModel(modelUri: string): boolean {
-  return /qwen.*embed/i.test(modelUri) || /embed.*qwen/i.test(modelUri);
+  return detectEmbedFormat(modelUri) === "qwen3";
+}
+
+function uriForEmbed(modelUri?: string): string {
+  return modelUri ?? process.env.QMD_EMBED_MODEL ?? DEFAULT_EMBED_MODEL;
 }
 
 /**
@@ -36,11 +42,8 @@ export function isQwen3EmbeddingModel(modelUri: string): boolean {
  * Uses Qwen3-Embedding instruct format when a Qwen embedding model is active.
  */
 export function formatQueryForEmbedding(query: string, modelUri?: string): string {
-  const uri = modelUri ?? process.env.QMD_EMBED_MODEL ?? DEFAULT_EMBED_MODEL;
-  if (isQwen3EmbeddingModel(uri)) {
-    return `Instruct: Retrieve relevant documents for the given query\nQuery: ${query}`;
-  }
-  return `task: search result | query: ${query}`;
+  const uri = uriForEmbed(modelUri);
+  return FORMATS[detectEmbedFormat(uri)].query(query);
 }
 
 /**
@@ -49,12 +52,8 @@ export function formatQueryForEmbedding(query: string, modelUri?: string): strin
  * Qwen3-Embedding encodes documents as raw text without special prefixes.
  */
 export function formatDocForEmbedding(text: string, title?: string, modelUri?: string): string {
-  const uri = modelUri ?? process.env.QMD_EMBED_MODEL ?? DEFAULT_EMBED_MODEL;
-  if (isQwen3EmbeddingModel(uri)) {
-    // Qwen3-Embedding: documents are raw text, no task prefix
-    return title ? `${title}\n${text}` : text;
-  }
-  return `title: ${title || "none"} | text: ${text}`;
+  const uri = uriForEmbed(modelUri);
+  return FORMATS[detectEmbedFormat(uri)].doc(text, title);
 }
 
 // =============================================================================
@@ -508,6 +507,16 @@ export class LlamaCpp implements LLM {
     this.expandContextSize = resolveExpandContextSize(config.expandContextSize);
     this.inactivityTimeoutMs = config.inactivityTimeoutMs ?? DEFAULT_INACTIVITY_TIMEOUT_MS;
     this.disposeModelsOnInactivity = config.disposeModelsOnInactivity ?? false;
+  }
+
+  /** Effective generate model URI (for status and diagnostics). */
+  getGenerateModelUri(): string {
+    return this.generateModelUri;
+  }
+
+  /** True when using the built-in default query-expansion model (not overridden by config or env). */
+  usingDefaultGenerateModel(): boolean {
+    return this.generateModelUri === DEFAULT_GENERATE_MODEL_URI;
   }
 
   get embedModelName(): string {
@@ -1149,9 +1158,7 @@ export class LlamaCpp implements LLM {
     });
 
     const intent = options.intent;
-    const prompt = intent
-      ? `/no_think Expand this search query: ${query}\nQuery intent: ${intent}`
-      : `/no_think Expand this search query: ${query}`;
+    const prompt = buildExpandPrompt(query, intent);
 
     // Create a bounded context for expansion to prevent large default VRAM allocations.
     const genContext = await this.generateModel!.createContext({
@@ -1178,7 +1185,7 @@ export class LlamaCpp implements LLM {
 
       const lines = result.trim().split("\n");
       const queryLower = query.toLowerCase();
-      const queryTerms = queryLower.replace(/[^a-z0-9\s]/g, " ").split(/\s+/).filter(Boolean);
+      const queryTerms = (queryLower.match(/[\p{L}\p{N}]+/gu) ?? []).map((t) => t.toLowerCase());
 
       const hasQueryTerm = (text: string): boolean => {
         const lower = text.toLowerCase();

@@ -27,6 +27,13 @@ import {
   type RerankDocument,
   type ILLMSession,
 } from "./llm.js";
+import { shouldSkipLlmExpansion } from "./expandPrompt.js";
+import { containsCJK } from "./i18n/cjk.js";
+import { getTokenizerFamily, resolveTokenizer } from "./fts/tokenizer.js";
+import {
+  segmentCJK,
+  shouldApplyJiebaSegmentation,
+} from "./fts/segmentCJK.js";
 import type {
   NamedCollection,
   Collection,
@@ -831,10 +838,11 @@ function initializeDatabase(db: Database): void {
   `);
 
   // FTS - index filepath (collection/path), title, and content
+  const ftsTokenizerInit = resolveTokenizer();
   db.exec(`
     CREATE VIRTUAL TABLE IF NOT EXISTS documents_fts USING fts5(
       filepath, title, body,
-      tokenize='porter unicode61'
+      tokenize='${ftsTokenizerInit}'
     )
   `);
 
@@ -875,6 +883,149 @@ function initializeDatabase(db: Database): void {
       WHERE new.active = 1;
     END
   `);
+
+  reconcileFTSState(db);
+}
+
+function readStoreConfig(db: Database, key: string): string | undefined {
+  const row = db.prepare(`SELECT value FROM store_config WHERE key = ?`).get(key) as { value: string } | null;
+  return row?.value ?? undefined;
+}
+
+function writeStoreConfig(db: Database, key: string, value: string): void {
+  db.prepare(`INSERT INTO store_config (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value`).run(key, value);
+}
+
+/** Persisted FTS body segmentation; missing row means identity (review-5 #2). */
+export function readSegmenterState(db: Database): "identity" | "jieba" {
+  const v = readStoreConfig(db, "fts_segmenter_state");
+  return v === "jieba" ? "jieba" : "identity";
+}
+
+const tokenizerFamilyCache = new WeakMap<Database, string>();
+
+export function getTokenizerFamilyForDb(db: Database): string {
+  let family = tokenizerFamilyCache.get(db);
+  if (family !== undefined) return family;
+  const row = db.prepare(`SELECT sql FROM sqlite_master WHERE type='table' AND name='documents_fts'`).get() as { sql?: string } | undefined;
+  const m = row?.sql?.match(/tokenize\s*=\s*'([^']+)'/i);
+  family = getTokenizerFamily(m?.[1] ?? "porter unicode61");
+  tokenizerFamilyCache.set(db, family);
+  return family;
+}
+
+function parseTokenizerFromMaster(db: Database): string | null {
+  const row = db.prepare(`SELECT sql FROM sqlite_master WHERE type='table' AND name='documents_fts'`).get() as { sql?: string } | undefined;
+  if (!row?.sql) return null;
+  const m = row.sql.match(/tokenize\s*=\s*'([^']+)'/i);
+  return m?.[1]?.trim() ?? null;
+}
+
+function walkAndResyncFTSBodies(db: Database, tokenizerFamily: string): void {
+  const apply = shouldApplyJiebaSegmentation(tokenizerFamily);
+  const rows = db.prepare(`
+    SELECT d.id AS docid, d.collection || '/' || d.path AS filepath, d.title, c.doc AS body
+    FROM documents d JOIN content c ON c.hash = d.hash
+    WHERE d.active = 1
+  `).all() as { docid: number; filepath: string; title: string; body: string }[];
+  const stmt = db.prepare(
+    `INSERT OR REPLACE INTO documents_fts(rowid, filepath, title, body) VALUES (?, ?, ?, ?)`
+  );
+  const tx = db.transaction(() => {
+    for (const r of rows) {
+      const body = apply && containsCJK(r.body) ? segmentCJK(r.body) : r.body;
+      stmt.run(r.docid, r.filepath, r.title, body);
+    }
+  });
+  tx();
+}
+
+const FTS_TRIGGERS_SQL = `
+CREATE TRIGGER documents_ai AFTER INSERT ON documents
+WHEN new.active = 1
+BEGIN
+  INSERT INTO documents_fts(rowid, filepath, title, body)
+  SELECT
+    new.id,
+    new.collection || '/' || new.path,
+    new.title,
+    (SELECT doc FROM content WHERE hash = new.hash)
+  WHERE new.active = 1;
+END;
+CREATE TRIGGER documents_ad AFTER DELETE ON documents BEGIN
+  DELETE FROM documents_fts WHERE rowid = old.id;
+END;
+CREATE TRIGGER documents_au AFTER UPDATE ON documents
+BEGIN
+  DELETE FROM documents_fts WHERE rowid = old.id AND new.active = 0;
+  INSERT OR REPLACE INTO documents_fts(rowid, filepath, title, body)
+  SELECT
+    new.id,
+    new.collection || '/' || new.path,
+    new.title,
+    (SELECT doc FROM content WHERE hash = new.hash)
+  WHERE new.active = 1;
+END;
+`;
+
+function rebuildFTSWithSegmentation(db: Database, tokenizerFamily: string): void {
+  db.exec(`DROP TRIGGER IF EXISTS documents_ai`);
+  db.exec(`DROP TRIGGER IF EXISTS documents_ad`);
+  db.exec(`DROP TRIGGER IF EXISTS documents_au`);
+  db.exec(`DROP TABLE IF EXISTS documents_fts`);
+  const tok = resolveTokenizer();
+  db.exec(`
+    CREATE VIRTUAL TABLE documents_fts USING fts5(
+      filepath, title, body,
+      tokenize='${tok}'
+    )
+  `);
+  db.exec(FTS_TRIGGERS_SQL);
+  walkAndResyncFTSBodies(db, tokenizerFamily);
+}
+
+function reconcileFTSState(db: Database): void {
+  const targetTokenizer = resolveTokenizer();
+  const currentTokenizer = parseTokenizerFromMaster(db);
+  const tokenizerChanged = currentTokenizer !== targetTokenizer;
+
+  const targetTokenizerFamily = getTokenizerFamily(targetTokenizer);
+  const targetSegmenter: "identity" | "jieba" = shouldApplyJiebaSegmentation(targetTokenizerFamily)
+    ? "jieba"
+    : "identity";
+  const currentSegmenter = readSegmenterState(db);
+  const segmenterChanged = currentSegmenter !== targetSegmenter;
+
+  if (tokenizerChanged) {
+    console.log(
+      `[qmd] FTS tokenizer mismatch (${currentTokenizer ?? "none"} → ${targetTokenizer}), rebuilding FTS…`
+    );
+    rebuildFTSWithSegmentation(db, targetTokenizerFamily);
+  } else if (segmenterChanged) {
+    console.log(`[qmd] Resyncing FTS bodies (segmenter: ${currentSegmenter} → ${targetSegmenter})…`);
+    walkAndResyncFTSBodies(db, targetTokenizerFamily);
+  }
+
+  if (tokenizerChanged || segmenterChanged) {
+    writeStoreConfig(db, "fts_segmenter_state", targetSegmenter);
+    tokenizerFamilyCache.delete(db);
+  }
+}
+
+function syncFtsBody(db: Database, collection: string, path: string): void {
+  const tokenizerFamily = getTokenizerFamilyForDb(db);
+  if (!shouldApplyJiebaSegmentation(tokenizerFamily)) return;
+  const row = db.prepare(`
+    SELECT d.id AS docid, d.collection || '/' || d.path AS filepath, d.title, c.doc AS body
+    FROM documents d JOIN content c ON c.hash = d.hash
+    WHERE d.collection = ? AND d.path = ? AND d.active = 1
+  `).get(collection, path) as { docid: number; filepath: string; title: string; body: string } | undefined;
+  if (!row || !containsCJK(row.body)) return;
+  const segmented = segmentCJK(row.body);
+  db.prepare(`
+    INSERT OR REPLACE INTO documents_fts(rowid, filepath, title, body)
+    VALUES (?, ?, ?, ?)
+  `).run(row.docid, row.filepath, row.title, segmented);
 }
 
 // =============================================================================
@@ -2098,6 +2249,7 @@ export function insertDocument(
       modified_at = excluded.modified_at,
       active = 1
   `).run(collectionName, path, title, hash, createdAt, modifiedAt);
+  syncFtsBody(db, collectionName, path);
 }
 
 /**
@@ -2158,6 +2310,8 @@ export function findOrMigrateLegacyDocument(
       FROM documents WHERE id = ?
     `).run(legacy.id);
 
+    syncFtsBody(db, collectionName, path);
+
     return true;
   });
 
@@ -2177,6 +2331,10 @@ export function updateDocumentTitle(
 ): void {
   db.prepare(`UPDATE documents SET title = ?, modified_at = ? WHERE id = ?`)
     .run(title, modifiedAt, documentId);
+  const loc = db.prepare(`SELECT collection, path FROM documents WHERE id = ?`).get(documentId) as
+    | { collection: string; path: string }
+    | undefined;
+  if (loc) syncFtsBody(db, loc.collection, loc.path);
 }
 
 /**
@@ -2192,6 +2350,10 @@ export function updateDocument(
 ): void {
   db.prepare(`UPDATE documents SET title = ?, hash = ?, modified_at = ? WHERE id = ?`)
     .run(title, hash, modifiedAt, documentId);
+  const loc = db.prepare(`SELECT collection, path FROM documents WHERE id = ?`).get(documentId) as
+    | { collection: string; path: string }
+    | undefined;
+  if (loc) syncFtsBody(db, loc.collection, loc.path);
 }
 
 /**
@@ -2916,12 +3078,13 @@ function sanitizeHyphenatedTerm(term: string): string {
  *   DEC-0054               → "dec 0054"
  *   -multi-agent            → NOT "multi agent"
  */
-function buildFTS5Query(query: string): string | null {
+export function buildFTS5Query(query: string, tokenizerFamily: string): string | null {
   const positive: string[] = [];
   const negative: string[] = [];
 
   let i = 0;
-  const s = query.trim();
+  const input = shouldApplyJiebaSegmentation(tokenizerFamily) ? segmentCJK(query) : query;
+  const s = input.trim();
 
   while (i < s.length) {
     // Skip whitespace
@@ -2971,7 +3134,10 @@ function buildFTS5Query(query: string): string | null {
       } else {
         const sanitized = sanitizeFTS5Term(term);
         if (sanitized) {
-          const ftsTerm = `"${sanitized}"*`;  // Prefix match
+          const ftsTerm =
+            tokenizerFamily === "trigram" && containsCJK(sanitized)
+              ? `"${sanitized}"`
+              : `"${sanitized}"*`;
           if (negated) {
             negative.push(ftsTerm);
           } else {
@@ -3022,7 +3188,8 @@ export function validateLexQuery(query: string): string | null {
 }
 
 export function searchFTS(db: Database, query: string, limit: number = 20, collectionName?: string): SearchResult[] {
-  const ftsQuery = buildFTS5Query(query);
+  const tokenizerFamily = getTokenizerFamilyForDb(db);
+  const ftsQuery = buildFTS5Query(query, tokenizerFamily);
   if (!ftsQuery) return [];
 
   // Use a CTE to force FTS5 to run first, then filter by collection.
@@ -3256,6 +3423,14 @@ export function insertEmbedding(
 // =============================================================================
 
 export async function expandQuery(query: string, model: string = DEFAULT_QUERY_MODEL, db: Database, intent?: string, llmOverride?: LlamaCpp): Promise<ExpandedQuery[]> {
+  const llm = llmOverride ?? getDefaultLlamaCpp();
+  if (shouldSkipLlmExpansion(query, { usingDefaultGenerateModel: llm.usingDefaultGenerateModel() })) {
+    return [
+      { type: "lex", query },
+      { type: "vec", query },
+    ];
+  }
+
   // Check cache first — stored as JSON preserving types
   const cacheKey = getCacheKey("expandQuery", { query, model, ...(intent && { intent }) });
   const cached = getCachedResult(db, cacheKey);
@@ -3273,7 +3448,6 @@ export async function expandQuery(query: string, model: string = DEFAULT_QUERY_M
     }
   }
 
-  const llm = llmOverride ?? getDefaultLlamaCpp();
   // Note: LlamaCpp uses hardcoded model, model parameter is ignored
   const results = await llm.expandQuery(query, { intent });
 

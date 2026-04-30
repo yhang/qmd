@@ -70,6 +70,8 @@ export interface Database {
   prepare(sql: string): Statement;
   loadExtension(path: string): void;
   close(): void;
+  /** better-sqlite3 / bun:sqlite transaction wrapper */
+  transaction<T>(fn: () => T): () => T;
 }
 
 export interface Statement {
